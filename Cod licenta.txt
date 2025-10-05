@@ -1,0 +1,171 @@
+import cv2
+import numpy as np
+from picarx import Picarx
+from time import sleep
+
+# 🔧 Inițializare robot și tilt camera
+px = Picarx()
+px.set_cam_tilt_angle(-20)
+sleep(0.2)
+
+# 🎯 Preprocesare imagine – masca pentru linii roșii
+def image_preprocessor(image):
+    img_hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    img_hsv[:, :, 2] = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(img_hsv[:, :, 2])
+
+    # Intervalul pentru roșu
+    lower_red1 = np.array([0, 80, 30])
+    upper_red1 = np.array([10, 255, 255])
+
+    lower_red2 = np.array([170, 80, 30])
+    upper_red2 = np.array([180, 255, 255])
+
+    mask1 = cv2.inRange(img_hsv, lower_red1, upper_red1)
+    mask2 = cv2.inRange(img_hsv, lower_red2, upper_red2)
+    mask = cv2.bitwise_or(mask1, mask2)
+
+    return mask
+
+def calculate_distance(left_avg, right_avg):
+    # Calculăm distanța între cele două linii pe baza coordonatelor lor x
+    if left_avg and right_avg:
+        # Calculăm distanța dintre cele două linii la nivelul y1 (partea de jos a imaginii)
+        distance = abs(left_avg[0] - right_avg[0])  # x1 stânga - x1 dreapta
+        return distance
+    return None
+
+def draw_guiding_line(frame, left_avg, right_avg):
+    if left_avg and right_avg:
+        # Calculăm mijlocul dintre cele două linii
+        x_center = (left_avg[0] + right_avg[0]) // 2
+        y_center = (left_avg[1] + right_avg[1]) // 2
+        x_end = (left_avg[2] + right_avg[2]) // 2
+        y_end = (left_avg[3] + right_avg[3]) // 2
+
+        # Desenăm linia galbenă
+        cv2.line(frame, (x_center, y_center), (x_end, y_end), (0, 255, 255), 4)  # galben
+    return frame
+
+
+# 🧠 Detectare linii și desenare linii mediate
+def detect_and_draw_lanes(frame, mask):
+    edges = cv2.Canny(mask, 50, 150)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=50, minLineLength=40, maxLineGap=100)
+
+    left_lines = []
+    right_lines = []
+
+    if lines is not None:
+        for line in lines:
+            for x1, y1, x2, y2 in line:
+                if x2 - x1 == 0:
+                    continue  # evităm împărțirea la 0
+                slope = (y2 - y1) / (x2 - x1)
+                if abs(slope) < 0.3:
+                    continue  # eliminăm liniile aproape orizontale
+                if slope < 0:
+                    left_lines.append((x1, y1, x2, y2))
+                else:
+                    right_lines.append((x1, y1, x2, y2))
+
+    def average_line(lines):
+        if len(lines) == 0:
+            return None
+        x_coords = []
+        y_coords = []
+        for x1, y1, x2, y2 in lines:
+            x_coords += [x1, x2]
+            y_coords += [y1, y2]
+        poly = np.polyfit(y_coords, x_coords, deg=1)
+        y1 = frame.shape[0]  # partea de jos a imaginii
+        y2 = int(frame.shape[0] * 0.6)  # 60% din înălțimea imaginii
+        x1 = int(np.polyval(poly, y1))
+        x2 = int(np.polyval(poly, y2))
+        return (x1, y1, x2, y2)
+
+    left_avg = average_line(left_lines)
+    right_avg = average_line(right_lines)
+
+    # Calculăm distanța dintre linii
+    distance = calculate_distance(left_avg, right_avg)
+    if distance is not None:
+        print(f"Distanta dintre linii: {distance} pixeli")
+
+    # Desenăm liniile stânga și dreapta
+    result = frame.copy()
+    if left_avg:
+        cv2.line(result, (left_avg[0], left_avg[1]), (left_avg[2], left_avg[3]), (255, 0, 0), 4)  # Albastru
+    if right_avg:
+        cv2.line(result, (right_avg[0], right_avg[1]), (right_avg[2], right_avg[3]), (255, 0, 0), 4)  # Albastru
+
+    # Desenăm linia galbenă
+    result = draw_guiding_line(result, left_avg, right_avg)
+
+    return result, left_avg, right_avg
+
+# Variabilă globală pentru filtrul EMA al unghiului de viraj
+prev_steering_angle = 0
+alpha = 0.2  # Coeficientul de netezire EMA (ajustabil pentru mai multă sau mai puțină netezime)
+
+def guide_robot(left_avg, right_avg):
+    global prev_steering_angle
+    
+    steering_angle = 0
+    
+    if left_avg:
+        x_left = left_avg[0]
+        target_x = 20  # Vrem ca linia stângă să fie la 20 pixeli de marginea stângă
+        error = x_left - target_x
+        Kp = 0.1
+        steering_angle = int(Kp * error)
+        
+    elif right_avg:
+        x_right = right_avg[0]
+        target_x = 620  # Vrem ca linia dreaptă să fie la 620 pixeli de marginea stângă
+        error = x_right - target_x
+        Kp = 0.1
+        steering_angle = int(Kp * error)
+    
+    # Aplicăm filtrul EMA pentru o tranziție mai lină
+    filtered_steering = int(alpha * steering_angle + (1 - alpha) * prev_steering_angle)
+    prev_steering_angle = filtered_steering
+    
+    filtered_steering = np.clip(filtered_steering, -25, 25)
+    px.set_dir_servo_angle(filtered_steering)
+    px.forward(0.8)
+    
+    print(f"Steering Angle: {filtered_steering}")
+
+# 📷 Inițializare cameră USB
+cap = cv2.VideoCapture(0)  # 0 = prima cameră USB detectată
+
+# Setăm rezoluția pentru a face imaginea mai lată
+cap.set(3, 640)  # Lățime (1280px)
+cap.set(4, 320)   # Înălțime (720px)
+
+sleep(1)
+
+# 🔁 Bucla principală
+while True:
+    ret, frame = cap.read()  # Capturăm un cadru de la camera USB
+    if not ret:
+        print("Eroare la capturarea imaginii!")
+        continue
+    
+    mask = image_preprocessor(frame)
+    lane_result, left_avg, right_avg = detect_and_draw_lanes(frame, mask)
+
+    # 🪟 Afișăm imaginea originală cu overlay de linii
+    cv2.imshow("Camera - Linii detectate", lane_result)
+    cv2.imshow("Masca galbena", mask)
+
+    # Ghidăm robotul pe linia galbenă
+    guide_robot(left_avg, right_avg)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        px.stop()  # Oprește motoarele
+        break
+
+# Eliberăm resursele
+cap.release()
+cv2.destroyAllWindows()
